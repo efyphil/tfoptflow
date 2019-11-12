@@ -136,6 +136,16 @@ def flow_read(src_file):
             flow = np.fromfile(f, '<f') if scale < 0 else np.fromfile(f, '>f')
             flow = np.reshape(flow, (h, w, 3))[:, :, 0:2]
             flow = np.flipud(flow)
+    
+    elif src_file.lower().endswith('.npy'):
+        H, W = (376,1241)
+        flow_raw = np.load(src_file)
+        u = cv2.resize(flow_raw[...,0], (W,H))
+        v = cv2.resize(flow_raw[...,1], (W,H))
+        flow = np.dstack((u,v))
+        flow[..., 0] *= W
+        flow[..., 1] *= H
+
     else:
         raise IOError
 

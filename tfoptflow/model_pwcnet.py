@@ -1,10 +1,7 @@
 """
 model_pwcnet.py
-
 PWC-Net model class.
-
 Written by Phil Ferriere
-
 Licensed under the MIT License (see LICENSE for details)
 """
 
@@ -17,7 +14,7 @@ import pandas as pd
 import tensorflow as tf
 from tqdm import trange
 from tensorflow.contrib.mixed_precision import LossScaleOptimizer, FixedLossScaleManager
-
+from tensorflow.python.client import timeline
 from model_base import ModelBase
 from optflow import flow_write, flow_write_as_png, flow_mag_stats
 from losses import pwcnet_loss
@@ -26,6 +23,7 @@ from multi_gpus import assign_to_device, average_gradients
 from core_warp import dense_image_warp
 from core_costvol import cost_volume
 from utils import tf_where
+import numpy as np
 
 _DEBUG_USE_REF_IMPL = False
 
@@ -85,6 +83,8 @@ _DEFAULT_PWCNET_TRAIN_OPTIONS = {
     'use_dense_cx': False,
     # if True, use model with residual connections (4705064 params w/o, 6774064 params with (+2069000) (no dense conn.))
     'use_res_cx': False,
+    'ret_feat': False,
+    'resize':True
 }
 
 _DEFAULT_PWCNET_FINETUNE_OPTIONS = {
@@ -141,6 +141,8 @@ _DEFAULT_PWCNET_FINETUNE_OPTIONS = {
     'use_dense_cx': False,
     # if True, use model with residual connections (4705064 params w/o, 6774064 params with (+2069000) (no dense conn.))
     'use_res_cx': False,
+    'ret_feat': False,
+    'resize':True
 }
 
 _DEFAULT_PWCNET_VAL_OPTIONS = {
@@ -169,6 +171,8 @@ _DEFAULT_PWCNET_VAL_OPTIONS = {
     'use_dense_cx': False,
     # if True, use model with residual connections (4705064 params w/o, 6774064 params with (+2069000) (no dense conn.))
     'use_res_cx': False,
+    'ret_feat': False,
+    'resize':True
 }
 
 _DEFAULT_PWCNET_TEST_OPTIONS = {
@@ -195,6 +199,8 @@ _DEFAULT_PWCNET_TEST_OPTIONS = {
     'use_dense_cx': False,
     # if True, use model with residual connections (4705064 params w/o, 6774064 params with (+2069000) (no dense conn.))
     'use_res_cx': False,
+    'ret_feat': False,
+    'resize':True
 }
 
 # from ref_model import PWCNet
@@ -214,10 +220,8 @@ class ModelPWCNet(ModelBase):
             the one used in Dosovitskiy et al's "FlowNet: Learning optical flow with convolutional networks" paper
             (multiscale training loss). For fine-tuning, the loss function used is described at the top of page 5
             (robust training loss).
-
             Per page 5 of paper, section "Implementation details," the trade-off weight gamma in the regularization term
             is usually set to 0.0004.
-
             Per page 5 of paper, section "Implementation details," we first train the models using the FlyingChairs
             dataset using the S<sub>long</sub> learning rate schedule introduced in E. Ilg et al.'s "FlowNet 2.0:
             Evolution of optical flow estimation with deep networks", starting from 0.0001 and reducing the learning
@@ -472,6 +476,16 @@ class ModelPWCNet(ModelBase):
             pred_flows_pyramid.append(pyramid)
 
         return pred_flows, pred_flows_pyramid
+    
+    def postproc_y_hat_test_with_features(self, y_hat, adapt_info=None):
+        
+        assert (isinstance(y_hat, list) and len(y_hat) == 2)
+        pred_flows = y_hat[0]
+        if adapt_info is not None:
+            pred_flows = pred_flows[:, 0:adapt_info[1], 0:adapt_info[2], :]
+        features = y_hat[1]
+        
+        return pred_flows, features
 
     def postproc_y_hat_train(self, y_hat, adapt_info=None):
         """Postprocess the results coming from the network during training.
@@ -953,7 +967,48 @@ class ModelPWCNet(ModelBase):
             return preds[0:self.ds.tst_size], ids[0:self.ds.tst_size]
         else:
             return None
+        
+        
+    def return_features(self, img_pairs, batch_size=1, verbose=False):
+        with self.graph.as_default():
+            # Chunk image pair list
+            batch_size = self.opts['batch_size']
+            test_size = len(img_pairs)
+            rounds, rounds_left = divmod(test_size, batch_size)
+            if rounds_left:
+                rounds += 1
 
+            # Loop through input samples and run inference on them
+            preds, test_ptr = [], 0
+            rng = trange(rounds, ascii=True, ncols=100, desc='Predicting flows') if verbose else range(rounds)
+            for _round in rng:
+                # In batch mode, make sure to wrap around if there aren't enough input samples to process
+                if test_ptr + batch_size < test_size:
+                    new_ptr = test_ptr + batch_size
+                    indices = list(range(test_ptr, test_ptr + batch_size))
+                else:
+                    new_ptr = (test_ptr + batch_size) % test_size
+                    indices = list(range(test_ptr, test_size)) + list(range(0, new_ptr))
+                test_ptr = new_ptr
+
+                # Repackage input image pairs as np.ndarray
+                x = np.array([img_pairs[idx] for idx in indices])
+
+                # Make input samples conform to the network's requirements
+                # x: [batch_size,2,H,W,3] uint8; x_adapt: [batch_size,2,H,W,3] float32
+                x_adapt, x_adapt_info = self.adapt_x(x)
+                if x_adapt_info is not None:
+                    y_adapt_info = (x_adapt_info[0], x_adapt_info[2], x_adapt_info[3], 2)
+                else:
+                    y_adapt_info = None
+
+                # Run the adapted samples through the network
+                feed_dict = {self.x_tnsr: x_adapt}
+                y_hat = self.sess.run(self.y_hat_test_tnsr, feed_dict=feed_dict)
+                y_hats, features = self.postproc_y_hat_test_with_features(y_hat, y_adapt_info)
+
+        return y_hats, features
+        
     def predict_from_img_pairs(self, img_pairs, batch_size=1, verbose=False):
         """Inference loop. Run inference on a list of image pairs.
         Args:
@@ -1005,6 +1060,83 @@ class ModelPWCNet(ModelBase):
                     preds.append(y_hat)
 
         return preds[0:test_size]
+    
+    
+    def predict_from_img_pairs_save(self, img_pairs, path_to_flow, batch_size=1, verbose=False):
+        """Inference loop. Run inference on a list of image pairs.
+        Args:
+            img_pairs: list of image pairs/tuples in list((img_1, img_2),...,(img_n, img_nplusone)) format.
+            batch_size: size of the batch to process (all images must have the same dimension, if batch_size>1)
+            verbose: if True, show progress bar
+        Returns:
+            Predicted flows in list format
+        """
+        i = 0
+        with self.graph.as_default():
+            # Chunk image pair list
+            batch_size = self.opts['batch_size']
+            test_size = len(img_pairs)
+            rounds, rounds_left = divmod(test_size, batch_size)
+            if rounds_left:
+                rounds += 1
+
+            # Loop through input samples and run inference on them
+            preds, test_ptr = [], 0
+            rng = trange(rounds, ascii=True, ncols=100, desc='Predicting flows') if verbose else range(rounds)
+
+            #start=time.time()
+            # In batch mode, make sure to wrap around if there aren't enough input samples to process
+            if test_ptr + batch_size < test_size:
+                new_ptr = test_ptr + batch_size
+                indices = list(range(test_ptr, test_ptr + batch_size))
+            else:
+                new_ptr = (test_ptr + batch_size) % test_size
+                indices = list(range(test_ptr, test_size)) + list(range(0, new_ptr))
+            test_ptr = new_ptr
+            #duration = time.time() - start
+           # print('In batch mode, make sure to wrap around if there arent enough input samples to process', duration*1000, 'ms')
+            # Repackage input image pairs as np.ndarray
+            x = np.array([img_pairs[idx] for idx in indices])
+
+            # Make input samples conform to the network's requirements
+            # x: [batch_size,2,H,W,3] uint8; x_adapt: [batch_size,2,H,W,3] float32
+            #start=time.time()
+            x_adapt, x_adapt_info = self.adapt_x(x)
+            if x_adapt_info is not None:
+                y_adapt_info = (x_adapt_info[0], x_adapt_info[2], x_adapt_info[3], 2)
+            else:
+                y_adapt_info = None
+            #duration = time.time() - start
+            #print('Make input samples conform to the networks requirements' , duration * 1000, 'ms')
+            #profiler 
+            #run_metadata = tf.RunMetadata()
+            #options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+            # Run the adapted samples through the network
+            feed_dict = {self.x_tnsr: x_adapt}
+            #start = time.time()
+            y_hat = self.sess.run(self.y_hat_test_tnsr, feed_dict=feed_dict)#,options=options, run_metadata=run_metadata)
+            #duration = time.time() - start
+            #print('Run the adapted samples through the network', duration* 1000, 'ms')
+            #fetched_timeline = timeline.Timeline(run_metadata.step_stats)
+            #chrome_trace = fetched_timeline.generate_chrome_trace_format()
+            #with open('timeline_02_step_6.json', 'w') as f:
+            #    f.write(chrome_trace)
+            y_hats, _ = self.postproc_y_hat_test(y_hat, y_adapt_info)
+            y_hats = y_hats[0]
+            y_hats[...,0] /= y_hats.shape[0]
+            y_hats[...,1] /= y_hats.shape[1]
+            print(path_to_flow)
+            np.save(path_to_flow, y_hats)
+            # Return flat list of predicted labels
+
+            #for y_hat in y_hats:
+            #    y_hat[...,0] /= np.array(y_hat[...,0]).shape[0]
+            #    y_hat[...,1] /= np.array(y_hat[...,0]).shape[1]
+            #    print(path_to_flow)
+                #np.save(path_to_flow, y_hat)
+                #preds.append(y_hat)
+
+    #return preds[0:test_size]
 
     ###
     # PWC-Net pyramid helpers
@@ -1026,11 +1158,9 @@ class ModelPWCNet(ModelBase):
             Per page 15, individual images of the image pair are encoded using the same Siamese network. Each
             convolution is followed by a leaky ReLU unit. The convolutional layer and the x2 downsampling layer at
             each level is implemented using a single convolutional layer with a stride of 2.
-
             Note that Figure 4 on page 15 differs from the PyTorch implementation in two ways:
             - It's missing a convolution layer at the end of each conv block
             - It shows a number of filters of 192 (instead of 196) at the end of the last conv block
-
         Ref PyTorch code:
             def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):
                 return nn.Sequential(
@@ -1040,23 +1170,18 @@ class ModelPWCNet(ModelBase):
             self.conv1a  = conv(3,   16, kernel_size=3, stride=2)
             self.conv1aa = conv(16,  16, kernel_size=3, stride=1)
             self.conv1b  = conv(16,  16, kernel_size=3, stride=1)
-
             self.conv2a  = conv(16,  32, kernel_size=3, stride=2)
             self.conv2aa = conv(32,  32, kernel_size=3, stride=1)
             self.conv2b  = conv(32,  32, kernel_size=3, stride=1)
-
             self.conv3a  = conv(32,  64, kernel_size=3, stride=2)
             self.conv3aa = conv(64,  64, kernel_size=3, stride=1)
             self.conv3b  = conv(64,  64, kernel_size=3, stride=1)
-
             self.conv4a  = conv(64,  96, kernel_size=3, stride=2)
             self.conv4aa = conv(96,  96, kernel_size=3, stride=1)
             self.conv4b  = conv(96,  96, kernel_size=3, stride=1)
-
             self.conv5a  = conv(96, 128, kernel_size=3, stride=2)
             self.conv5aa = conv(128,128, kernel_size=3, stride=1)
             self.conv5b  = conv(128,128, kernel_size=3, stride=1)
-
             self.conv6aa = conv(128,196, kernel_size=3, stride=2)
             self.conv6a  = conv(196,196, kernel_size=3, stride=1)
             self.conv6b  = conv(196,196, kernel_size=3, stride=1)
@@ -1073,7 +1198,6 @@ class ModelPWCNet(ModelBase):
             c25 = self.conv5b(self.conv5aa(self.conv5a(c24)))
             c16 = self.conv6b(self.conv6a(self.conv6aa(c15)))
             c26 = self.conv6b(self.conv6a(self.conv6aa(c25))) # Lower-res
-
         Ref Caffee code:
             https://github.com/NVlabs/PWC-Net/blob/438ca897ae77e08f419ddce5f0d7fa63b0a27a77/Caffe/model/train.prototxt#L314-L1141
         """
@@ -1119,16 +1243,13 @@ class ModelPWCNet(ModelBase):
             CNN features and flow for backpropagation according to E. Ilg's FlowNet 2.0 paper.
             For non-translational motion, warping can compensate for some geometric distortions and put image patches
             at the right scale.
-
             Per page 3 of paper, section "3. Approach," the warping and cost volume layers have no learnable parameters
             and, hence, reduce the model size.
-
         Ref PyTorch code:
             # warp an image/tensor (im2) back to im1, according to the optical flow
             # x: [B, C, H, W] (im2)
             # flo: [B, 2, H, W] flow
             def warp(self, x, flo):
-
                 B, C, H, W = x.size()
                 # mesh grid
                 xx = torch.arange(0, W).view(1,-1).repeat(H,1)
@@ -1136,35 +1257,28 @@ class ModelPWCNet(ModelBase):
                 xx = xx.view(1,1,H,W).repeat(B,1,1,1)
                 yy = yy.view(1,1,H,W).repeat(B,1,1,1)
                 grid = torch.cat((xx,yy),1).float()
-
                 if x.is_cuda:
                     grid = grid.cuda()
                 vgrid = Variable(grid) + flo
-
                 # scale grid to [-1,1]
                 vgrid[:,0,:,:] = 2.0*vgrid[:,0,:,:]/max(W-1,1)-1.0
                 vgrid[:,1,:,:] = 2.0*vgrid[:,1,:,:]/max(H-1,1)-1.0
-
                 vgrid = vgrid.permute(0,2,3,1)
                 output = nn.functional.grid_sample(x, vgrid)
                 mask = torch.autograd.Variable(torch.ones(x.size())).cuda()
                 mask = nn.functional.grid_sample(mask, vgrid)
-
                 mask[mask<0.9999] = 0
                 mask[mask>0] = 1
-
                 return output*mask
             [...]
             warp5 = self.warp(c25, up_flow6*0.625)
             warp4 = self.warp(c24, up_flow5*1.25)
             warp3 = self.warp(c23, up_flow4*2.5)
             warp2 = self.warp(c22, up_flow3*5.0)
-
         Ref TF documentation:
             tf.contrib.image.dense_image_warp(image, flow, name='dense_image_warp')
             https://www.tensorflow.org/api_docs/python/tf/contrib/image/dense_image_warp
             https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/image/python/kernel_tests/dense_image_warp_test.py
-
         Other implementations:
             https://github.com/bryanyzhu/deepOF/blob/master/flyingChairsWrapFlow.py
             https://github.com/bryanyzhu/deepOF/blob/master/ucf101wrapFlow.py
@@ -1176,7 +1290,11 @@ class ModelPWCNet(ModelBase):
             print(msg)
         with tf.name_scope(name):
             return dense_image_warp(c2, sc_up_flow, name=op_name)
-
+    
+    def retfeat(self, c2, name='retfeat'):
+        with tf.name_scope(name):
+            return c2 
+    
     def deconv(self, x, lvl, name='up_flow'):
         """Upsample, not using a bilinear filter, but rather learn the weights of a conv2d_transpose op filters.
         Args:
@@ -1235,7 +1353,6 @@ class ModelPWCNet(ModelBase):
             a pixel from Image1 with its corresponding pixels in Image2. Most traditional optical flow techniques build
             the full cost volume at a single scale, which is both computationally expensive and memory intensive. By
             contrast, PWC-Net constructs a partial cost volume at multiple pyramid levels.
-
             The matching cost is implemented as the correlation between features of the first image and warped features
             of the second image:
                 CV<sup>l</sup>(x1,x2) = (C1<sup>l</sup>(x1))<sup>T</sup> . Cw<sup>l</sup>(x2) / N
@@ -1244,13 +1361,10 @@ class ModelPWCNet(ModelBase):
             pixels. A one-pixel motion at the top level corresponds to 2**(L−1) pixels at the full resolution images.
             Thus we can set d to be small, e.g. d=4. The dimension of the 3D cost volume is d**2 × Hl × Wl, where Hl
             and Wl denote the height and width of the L-th pyramid level, respectively.
-
             Per page 3 of paper, section "3. Approach," the warping and cost volume layers have no learnable parameters
             and, hence, reduce the model size.
-
             Per page 5 of paper, section "Implementation details," we use a search range of 4 pixels to compute the
             cost volume at each level.
-
         Ref PyTorch code:
         from correlation_package.modules.corr import Correlation
         self.corr = Correlation(pad_size=md, kernel_size=1, max_displacement=4, stride1=1, stride2=1, corr_multiply=1)
@@ -1298,20 +1412,16 @@ class ModelPWCNet(ModelBase):
             respectively 128, 128, 96, 64, and 32, which are kept fixed at all pyramid levels. The estimators at
             different levels have their own parameters instead of sharing the same parameters. This estimation process
             is repeated until the desired level, l0.
-
             Per page 5 of paper, section "Implementation details," we use a 7-level pyramid and set l0 to be 2, i.e.,
             our model outputs a quarter resolution optical flow and uses bilinear interpolation to obtain the
             full-resolution optical flow.
-
             The estimator architecture can be enhanced with DenseNet connections. The inputs to every convolutional
             layer are the output of and the input to its previous layer. DenseNet has more direct connections than
             traditional layers and leads to significant improvement in image classification.
-
             Note that we do not use DenseNet connections in this implementation because a) they increase the size of the
             model, and, b) per page 7 of paper, section "Optical flow estimator," removing the DenseNet connections
             results in higher training error but lower validation errors when the model is trained on FlyingChairs
             (that being said, after the model is fine-tuned on FlyingThings3D, DenseNet leads to lower errors).
-
         Ref PyTorch code:
             def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):
                 return nn.Sequential(
@@ -1462,7 +1572,6 @@ class ModelPWCNet(ModelBase):
             to post-process the flow. Thus we employ a sub-network, called the context network, to effectively enlarge
             the receptive field size of each output unit at the desired pyramid level. It takes the estimated flow and
             features of the second last layer from the optical flow estimator and outputs a refined flow.
-
             The context network is a feed-forward CNN and its design is based on dilated convolutions. It consists of
             7 convolutional layers. The spatial kernel for each convolutional layer is 3×3. These layers have different
             dilation constants. A convolutional layer with a dilation constant k means that an input unit to a filter
@@ -1470,7 +1579,6 @@ class ModelPWCNet(ModelBase):
             horizontal directions. Convolutional layers with large dilation constants enlarge the receptive field of
             each output unit without incurring a large computational burden. From bottom to top, the dilation constants
             are 1, 2, 4, 8, 16, 1, and 1.
-
         Ref PyTorch code:
             def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):
                 return nn.Sequential(
@@ -1546,7 +1654,7 @@ class ModelPWCNet(ModelBase):
             c1, c2 = self.extract_features(x_tnsr)
 
             flow_pyr = []
-
+            ext_feat = self.retfeat(c1)
             for lvl in range(self.opts['pyr_lvls'], self.opts['flow_pred_lvl'] - 1, -1):
 
                 if lvl == self.opts['pyr_lvls']:
@@ -1585,9 +1693,13 @@ class ModelPWCNet(ModelBase):
                     # Upsample the predicted flow (final output) to match the size of the images
                     scaler = 2**self.opts['flow_pred_lvl']
                     if self.dbg:
-                        print(f'Upsampling {flow.op.name} by {scaler} in each dimension.')
-                    size = (lvl_height * scaler, lvl_width * scaler)
-                    flow_pred = tf.image.resize_bilinear(flow, size, name="flow_pred") * scaler
+                        print(f'Upsampling {flow.op.name} by {scaler} in each dimension.')                
                     break
-
-            return flow_pred, flow_pyr
+            if self.opts['ret_feat'] == True:
+                return flow_pred, ext_feat[1:]
+            elif self.opts['resize'] == True:
+                size = (lvl_height * scaler, lvl_width * scaler)
+                flow_pred = tf.image.resize_bilinear(flow, size, name="flow_pred") * scaler
+                return flow_pred, flow_pyr
+            else:
+                return flow, flow_pyr
