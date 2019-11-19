@@ -10,8 +10,8 @@ Licensed under the MIT License (see LICENSE for details)
 
 from __future__ import absolute_import, division, print_function
 import numpy as np
-import tensorflow as tf
-import tensorflow.contrib.slim as slim
+import tensorflow.compat.v1 as tf
+#import tensorflow.contrib.slim as slim
 
 from ckpt_mgr import BestCheckpointSaver
 from logger import OptFlowTBLogger
@@ -336,7 +336,7 @@ class ModelBase:
     ###
     def summary(self):
         model_vars = tf.trainable_variables()
-        slim.model_analyzer.analyze_vars(model_vars, print_info=True)
+        #slim.model_analyzer.analyze_vars(model_vars, print_info=True)
 
     def print_config(self):
         """Display configuration values.

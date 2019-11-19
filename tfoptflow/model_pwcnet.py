@@ -4,17 +4,17 @@ PWC-Net model class.
 Written by Phil Ferriere
 Licensed under the MIT License (see LICENSE for details)
 """
-
 from __future__ import absolute_import, division, print_function
+
 import time
 import datetime
 import warnings
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 from tqdm import trange
-from tensorflow.contrib.mixed_precision import LossScaleOptimizer, FixedLossScaleManager
-from tensorflow.python.client import timeline
+from tensorflow.keras.mixed_precision.experimental import LossScaleOptimizer #FixedLossScaleManager
+#from tensorflow.compat.v1.python.client import timeline
 from model_base import ModelBase
 from optflow import flow_write, flow_write_as_png, flow_mag_stats
 from losses import pwcnet_loss
@@ -24,6 +24,70 @@ from core_warp import dense_image_warp
 from core_costvol import cost_volume
 from utils import tf_where
 import numpy as np
+import abc
+import six
+
+@six.add_metaclass(abc.ABCMeta)
+class LossScaleManager(object):
+    """Abstract loss scale manager class.
+    Loss scale managers with a different strategy should subclass this class.
+    Loss scaling is a process that:
+    1) Applies a multiplier on the loss before computing gradients, and
+    2) Applies the reciprocal of the multiplier on the gradients before they are
+     applied on variables.
+    This class is used together with
+    `tf.contrib.mixed_precision.LossScaleOptimizer` for mixed precision training
+    (float32 variables and float16 ops) on Nvidia GPUs in order to achieve the
+    same model quality as single precision training, with the benefits of
+    potential higher throughput.
+    See `tf.contrib.mixed_precision.LossScaleOptimizer` for more details.
+    """
+
+    @abc.abstractmethod
+    def get_loss_scale(self):
+        """Returns the loss scale as a scalar `float32` tensor."""
+        pass
+
+    @abc.abstractmethod
+    def update_loss_scale(self, finite_grads):
+        """Updates loss scale based on if gradients are finite in current step.
+        Args:
+          finite_grads: bool scalar tensor indicating if all gradients are
+            finite (i.e., not inf or nan).
+        Returns:
+          An op, when executed updates the loss scale. If eager execution is
+          enabled, does not return anything.
+        """
+        del finite_grads
+        return
+    
+    
+class FixedLossScaleManager(LossScaleManager):
+    """Loss scale manager with a fixed loss scale.
+    The loss scale is not updated for the lifetime of the class.
+    """
+
+    def __init__(self, loss_scale):
+        """Creates the fixed loss scale manager.
+        Args:
+          loss_scale: A Python float. Its ideal value varies depending on models to
+            run. Choosing a too small loss_scale might affect model quality; a too
+            big loss_scale might cause inf or nan. There is no single right
+            loss_scale to apply. There is no harm choosing a relatively big number
+            as long as no nan or inf is encountered in training.
+        Raises:
+          ValueError: If loss_scale is less than 1.
+        """
+        if loss_scale < 1:
+            raise ValueError("loss scale must be at least 1.")
+        self._loss_scale = ops.convert_to_tensor(loss_scale, dtype=dtypes.float32)
+
+    def get_loss_scale(self):
+        return self._loss_scale
+
+    def update_loss_scale(self, finite_grads):
+        del finite_grads
+        return gen_control_flow_ops.no_op()
 
 _DEBUG_USE_REF_IMPL = False
 
